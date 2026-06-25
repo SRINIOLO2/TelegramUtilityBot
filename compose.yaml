@@ -1,6 +1,7 @@
 services:
   bot:
     build: .
+    image: telegram-utility-bot:v2
     container_name: telegram-utility-bot
     restart: unless-stopped
     dns:
