@@ -3,6 +3,10 @@ services:
     build: .
     container_name: telegram-utility-bot
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+
 
