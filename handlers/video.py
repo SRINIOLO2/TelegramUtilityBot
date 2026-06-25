@@ -40,7 +40,7 @@ class VideoHandler:
         status_msg = await update.message.reply_text("🔄 Downloading video...")
 
         # Run downloading in an executor or async loop (yt-dlp is blocking, so we run it in a thread executor)
-        loop = context.application.loop
+        loop = asyncio.get_running_loop()
         try:
             success, raw_path, message = await asyncio.wait_for(
                 loop.run_in_executor(None, self.downloader.download, url),
