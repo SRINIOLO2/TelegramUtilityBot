@@ -28,9 +28,10 @@ class DownloaderService:
             "outtmpl": os.path.join(self.temp_dir, "%(id)s_raw.%(ext)s"),
             "max_filesize": 50 * 1024 * 1024,  # Telegram limit is 50MB
             "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": False,
+            "no_warnings": False,
             "nocheckcertificate": True,
+            "socket_timeout": 30,  # Prevent hanging on connections
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",

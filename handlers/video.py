@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -40,9 +41,15 @@ class VideoHandler:
 
         # Run downloading in an executor or async loop (yt-dlp is blocking, so we run it in a thread executor)
         loop = context.application.loop
-        success, raw_path, message = await loop.run_in_executor(
-            None, self.downloader.download, url
-        )
+        try:
+            success, raw_path, message = await asyncio.wait_for(
+                loop.run_in_executor(None, self.downloader.download, url),
+                timeout=120  # 2 minutes timeout for download
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Download timed out for {url}")
+            await status_msg.edit_text("❌ Download timed out after 2 minutes.")
+            return
 
         if not success or not raw_path:
             logger.error(f"Download failed for {url}: {message}")
@@ -51,9 +58,20 @@ class VideoHandler:
 
         # Optimize video for mobile streaming
         await status_msg.edit_text("⚙️ Optimizing video for mobile...")
-        final_path, optimized = await loop.run_in_executor(
-            None, self.downloader.optimize_video, raw_path
-        )
+        try:
+            final_path, optimized = await asyncio.wait_for(
+                loop.run_in_executor(None, self.downloader.optimize_video, raw_path),
+                timeout=180  # 3 minutes optimization timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Optimization timed out for {raw_path}")
+            if raw_path and os.path.exists(raw_path):
+                try:
+                    os.remove(raw_path)
+                except OSError:
+                    pass
+            await status_msg.edit_text("❌ Video optimization timed out.")
+            return
 
         # Upload video
         await status_msg.edit_text("📤 Uploading to Telegram...")
