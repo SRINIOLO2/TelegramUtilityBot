@@ -6,7 +6,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     filters,
-    ContextTypes
+    ContextTypes,
+    CallbackQueryHandler
 )
 from dotenv import load_dotenv
 
@@ -32,7 +33,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Welcome to your Video Downloader Bot!\n\n"
         "📹 *How to use*:\n"
         "Simply send or forward any Instagram Reel, Post, or TikTok video link to this chat, "
-        "and I will download and send it back to you as an inline-playable video file optimized for mobile.\n\n"
+        "and I will reply with an interactive download button so you can fetch the video when you're ready.\n\n"
         "Commands:\n"
         "• /start - Show this welcome message",
         parse_mode="Markdown"
@@ -58,6 +59,9 @@ def main():
 
     # Register Text Message Handler for video links
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, video_handler.handle_message))
+
+    # Register Callback Query Handler for inline buttons
+    app.add_handler(CallbackQueryHandler(video_handler.button_callback))
 
     # Start the bot
     logger.info("Bot is starting... Press Ctrl+C to stop.")

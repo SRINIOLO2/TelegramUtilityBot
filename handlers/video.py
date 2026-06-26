@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 from services.downloader import DownloaderService
 
@@ -20,10 +20,12 @@ SOCIAL_LINK_PATTERN = re.compile(
 class VideoHandler:
     def __init__(self, downloader_service: DownloaderService):
         self.downloader = downloader_service
+        # Cache to store the URL mapped to the message ID that contains the inline button
+        self.url_cache = {}
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Scans messages for Instagram/TikTok links and downloads/shares the video.
+        Scans messages for Instagram/TikTok links and replies with a download button.
         """
         if not update.message or not update.message.text:
             return
@@ -36,8 +38,39 @@ class VideoHandler:
         url = match.group(0)
         logger.info(f"Detected social media link: {url} from user {update.effective_user.id}")
 
-        # Send a status message
-        status_msg = await update.message.reply_text("🔄 Downloading video...")
+        # Send a reply with an inline keyboard
+        keyboard = [
+            [InlineKeyboardButton("🎬 Download Video", callback_data="download_video")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        reply_msg = await update.message.reply_text(
+            "Video link detected! Click the button below to download.",
+            reply_markup=reply_markup
+        )
+
+        # Store the URL using the reply message's ID as the key
+        self.url_cache[str(reply_msg.message_id)] = url
+
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Handles the inline button click to trigger the actual video download.
+        """
+        query = update.callback_query
+        await query.answer()
+
+        if query.data != "download_video":
+            return
+
+        msg_id = str(query.message.message_id)
+        url = self.url_cache.get(msg_id)
+
+        if not url:
+            await query.edit_message_text("❌ Link expired or not found. Please send the link again.")
+            return
+
+        # Start download process
+        await query.edit_message_text("🔄 Downloading video...")
 
         # Run downloading in an executor or async loop (yt-dlp is blocking, so we run it in a thread executor)
         loop = asyncio.get_running_loop()
@@ -48,16 +81,16 @@ class VideoHandler:
             )
         except asyncio.TimeoutError:
             logger.error(f"Download timed out for {url}")
-            await status_msg.edit_text("❌ Download timed out after 2 minutes.")
+            await query.edit_message_text("❌ Download timed out after 2 minutes.")
             return
 
         if not success or not raw_path:
             logger.error(f"Download failed for {url}: {message}")
-            await status_msg.edit_text(f"❌ {message}")
+            await query.edit_message_text(f"❌ {message}")
             return
 
         # Optimize video for mobile streaming
-        await status_msg.edit_text("⚙️ Optimizing video for mobile...")
+        await query.edit_message_text("⚙️ Optimizing video for mobile...")
         try:
             final_path, optimized = await asyncio.wait_for(
                 loop.run_in_executor(None, self.downloader.optimize_video, raw_path),
@@ -70,15 +103,15 @@ class VideoHandler:
                     os.remove(raw_path)
                 except OSError:
                     pass
-            await status_msg.edit_text("❌ Video optimization timed out.")
+            await query.edit_message_text("❌ Video optimization timed out.")
             return
 
         # Upload video
-        await status_msg.edit_text("📤 Uploading to Telegram...")
+        await query.edit_message_text("📤 Uploading to Telegram...")
         try:
             with open(final_path, 'rb') as video_file:
                 # Send the video file
-                await update.message.reply_video(
+                await query.message.reply_video(
                     video=video_file,
                     supports_streaming=True,
                     caption="Here is your video! 🎥",
@@ -86,10 +119,10 @@ class VideoHandler:
                 )
             
             # Clean up message status
-            await status_msg.delete()
+            await query.message.delete()
         except Exception as e:
             logger.exception(f"Failed to upload video to telegram: {e}")
-            await status_msg.edit_text(f"❌ Failed to upload video: {str(e)}")
+            await query.edit_message_text(f"❌ Failed to upload video: {str(e)}")
         finally:
             # Always clean up temp file
             if final_path and os.path.exists(final_path):
