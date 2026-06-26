@@ -107,11 +107,13 @@ class DownloaderService:
         # -movflags +faststart: allows stream-play in Telegram before complete download
         command = [
             "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "libx264",
-            "-preset", "superfast",
-            "-crf", "24",
+            "-c:v", "h264_nvenc",
+            "-preset", "fast",
+            "-cq", "24",
+            "-vsync", "2", # vfr: Variable framerate
             "-vf", "scale=min(720\\,iw):-2:force_original_aspect_ratio=decrease,format=yuv420p",
             "-c:a", "aac",
+            "-ac", "1", # mono audio
             "-b:a", "128k",
             "-movflags", "+faststart",
             output_path

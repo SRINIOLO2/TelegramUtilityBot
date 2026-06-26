@@ -1,7 +1,7 @@
 services:
   bot:
     build: .
-    image: telegram-utility-bot:v3
+    image: telegram-utility-bot:v4
     container_name: telegram-utility-bot
     restart: unless-stopped
     dns:
@@ -9,5 +9,10 @@ services:
       - 1.1.1.1
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-
-
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
