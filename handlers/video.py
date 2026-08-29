@@ -48,7 +48,18 @@ class VideoHandler:
         url = match.group(0)
         logger.info(f"Detected social media link: {url} from user {update.effective_user.id}")
 
-        # Send a reply with an inline keyboard
+        # If it's an Instagram link, we can use ddinstagram to force a native Telegram embed
+        if "instagram.com" in url.lower():
+            new_url = url.lower().replace("instagram.com", "ddinstagram.com").replace("www.ddinstagram.com", "ddinstagram.com")
+            await update.message.reply_text(
+                f"Here is your playable link:\n{new_url}",
+                disable_web_page_preview=False
+            )
+            # Optionally delete the user's original message if you want to keep chat clean:
+            # await update.message.delete()
+            return
+
+        # Send a reply with an inline keyboard for other links (like TikTok)
         keyboard = [
             [InlineKeyboardButton("🎬 Download Video", callback_data="download_video")]
         ]
