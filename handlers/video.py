@@ -30,6 +30,8 @@ class VideoHandler:
         self.downloader = downloader_service
         # Cache to store the URL mapped to the message ID or callback query data
         self.url_cache = {}
+        # Store recent links per user for quick inline access
+        self.recent_user_links = {}
         
         # Concurrency protections
         self.global_semaphore = asyncio.Semaphore(3)
@@ -40,57 +42,99 @@ class VideoHandler:
             self.user_locks[user_id] = asyncio.Lock()
         return self.user_locks[user_id]
 
+    def save_user_link(self, user_id: int, url: str) -> None:
+        if user_id not in self.recent_user_links:
+            self.recent_user_links[user_id] = []
+        if url in self.recent_user_links[user_id]:
+            self.recent_user_links[user_id].remove(url)
+        self.recent_user_links[user_id].insert(0, url)
+        # Keep last 5 links
+        self.recent_user_links[user_id] = self.recent_user_links[user_id][:5]
+
     async def handle_inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Handles inline queries so users can type @bot <link> in any chat.
+        Handles inline queries so users can type @bot <link> or just @bot in any chat.
         """
         query = update.inline_query.query.strip()
-        if not query:
-            return
+        user_id = update.inline_query.from_user.id
+        results = []
 
-        match = SOCIAL_LINK_PATTERN.search(query)
-        if not match:
-            return
+        # Case 1: User pasted a link in the inline query
+        if query:
+            match = SOCIAL_LINK_PATTERN.search(query)
+            if match:
+                url = match.group(0)
+                self.save_user_link(user_id, url)
+                url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+                self.url_cache[url_hash] = url
 
-        url = match.group(0)
-        # Create a short hash for callback data
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-        self.url_cache[url_hash] = url
+                keyboard = [
+                    [InlineKeyboardButton("🎬 Download & Send Video", callback_data=f"dl_{url_hash}")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
 
-        keyboard = [
-            [InlineKeyboardButton("🎬 Download & Send Video", callback_data=f"dl_{url_hash}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+                results.append(
+                    InlineQueryResultArticle(
+                        id=url_hash,
+                        title="🎬 Download Video",
+                        description=f"Send download button for: {url[:45]}...",
+                        input_message_content=InputTextMessageContent(
+                            f"📹 *Video Link:*\n{url}\n\n_Click below to download directly to this chat._",
+                            parse_mode="Markdown"
+                        ),
+                        reply_markup=reply_markup
+                    )
+                )
 
-        results = [
-            InlineQueryResultArticle(
-                id=url_hash,
-                title="🎬 Download Video",
-                description=f"Send download button for: {url[:45]}...",
-                input_message_content=InputTextMessageContent(
-                    f"📹 *Video Link:*\n{url}\n\n_Click below to download directly to this chat._",
-                    parse_mode="Markdown"
-                ),
-                reply_markup=reply_markup
-            )
-        ]
+        # Case 2: User opened @bot with empty query -> show recent links!
+        if not results and user_id in self.recent_user_links:
+            for idx, url in enumerate(self.recent_user_links[user_id]):
+                url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+                self.url_cache[url_hash] = url
+                keyboard = [
+                    [InlineKeyboardButton("🎬 Download & Send Video", callback_data=f"dl_{url_hash}")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.inline_query.answer(results, cache_time=0)
+                results.append(
+                    InlineQueryResultArticle(
+                        id=f"rec_{url_hash}_{idx}",
+                        title=f"Recent Link #{idx+1}",
+                        description=f"{url[:50]}...",
+                        input_message_content=InputTextMessageContent(
+                            f"📹 *Video Link:*\n{url}\n\n_Click below to download directly to this chat._",
+                            parse_mode="Markdown"
+                        ),
+                        reply_markup=reply_markup
+                    )
+                )
+
+        await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Scans messages for Instagram/TikTok links and replies with a download button.
+        Scans messages for Instagram/TikTok links, or checks replied-to messages if user mentions the bot.
         """
-        if not update.message or not update.message.text:
+        if not update.message:
             return
 
-        text = update.message.text
+        text = update.message.text or update.message.caption or ""
         match = SOCIAL_LINK_PATTERN.search(text)
+
+        # If no link in the message itself, check if user replied to a message containing a link
+        if not match and update.message.reply_to_message:
+            replied = update.message.reply_to_message
+            replied_text = replied.text or replied.caption or ""
+            match = SOCIAL_LINK_PATTERN.search(replied_text)
+
         if not match:
             return
 
         url = match.group(0)
         logger.info(f"Detected social media link: {url} from user {update.effective_user.id}")
+
+        if update.effective_user:
+            self.save_user_link(update.effective_user.id, url)
 
         # Create a short hash for callback data
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
