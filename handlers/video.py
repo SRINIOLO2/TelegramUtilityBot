@@ -48,15 +48,7 @@ class VideoHandler:
         url = match.group(0)
         logger.info(f"Detected social media link: {url} from user {update.effective_user.id}")
 
-        if "instagram.com" in url.lower():
-            new_url = url.replace("instagram.com", "ddinstagram.com").replace("www.ddinstagram.com", "ddinstagram.com")
-            await update.message.reply_text(
-                f"Here is your playable link:\n{new_url}",
-                disable_web_page_preview=False
-            )
-            return
-
-        # Send a reply with an inline keyboard for other links (like TikTok)
+        # Send a reply with an inline keyboard for video download
         keyboard = [
             [InlineKeyboardButton("🎬 Download Video", callback_data="download_video")]
         ]

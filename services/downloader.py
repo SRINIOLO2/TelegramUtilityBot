@@ -39,8 +39,8 @@ class DownloaderService:
             }
         }
         
-        # Add cookies if available to bypass Instagram rate-limits/login walls
-        if os.path.exists("cookies.txt"):
+        # Add cookies if available as a valid file to bypass Instagram rate-limits/login walls
+        if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 0:
             ydl_opts["cookiefile"] = "cookies.txt"
 
         try:
