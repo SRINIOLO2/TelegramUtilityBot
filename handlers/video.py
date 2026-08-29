@@ -67,9 +67,9 @@ class VideoHandler:
         Handles the inline button click to trigger the actual video download.
         """
         query = update.callback_query
-        await query.answer()
 
         if query.data != "download_video":
+            await query.answer()
             return
 
         msg_id = str(query.message.message_id)
@@ -77,6 +77,7 @@ class VideoHandler:
         user_id = query.from_user.id
 
         if not url:
+            await query.answer()
             await query.edit_message_text("❌ Link expired or not found. Please send the link again.")
             return
 
@@ -85,6 +86,8 @@ class VideoHandler:
         if user_lock.locked():
             await query.answer("⚠️ You already have a video processing! Please wait.", show_alert=True)
             return
+            
+        await query.answer()
 
         async with user_lock:
             # Check global semaphore

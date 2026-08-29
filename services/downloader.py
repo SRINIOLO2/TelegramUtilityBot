@@ -38,6 +38,10 @@ class DownloaderService:
                 "Accept-Language": "en-US,en;q=0.9",
             }
         }
+        
+        # Add cookies if available to bypass Instagram rate-limits/login walls
+        if os.path.exists("cookies.txt"):
+            ydl_opts["cookiefile"] = "cookies.txt"
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
