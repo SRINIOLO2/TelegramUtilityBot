@@ -1,8 +1,9 @@
 FROM python:3.11-slim
 
-# Install ffmpeg and clean up apt caches to keep the image lightweight
+# Install ffmpeg and nodejs (for yt-dlp YouTube JS extraction) and clean up apt caches
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
