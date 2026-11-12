@@ -6,11 +6,24 @@ import re
 import shutil
 import subprocess
 import uuid
+from typing import Dict, List, Optional, Tuple
 import httpx
 import yt_dlp
-from typing import Tuple, Optional, List
+from services.url_patterns import is_safe_social_url
 
 logger = logging.getLogger(__name__)
+
+IFRAME_EMBED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "iframe",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+}
 
 
 class DownloaderService:
@@ -19,37 +32,85 @@ class DownloaderService:
         os.makedirs(self.temp_dir, exist_ok=True)
         self.ffmpeg_available = shutil.which("ffmpeg") is not None
         self.gallery_dl_available = shutil.which("gallery-dl") is not None
+        self.last_captions: Dict[str, str] = {}
         if not self.ffmpeg_available:
             logger.warning("ffmpeg is not installed or not in PATH. Videos will not be optimized for Telegram mobile.")
 
     def _has_cookies(self) -> bool:
         return os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 0
 
+    def get_caption(self, url: str) -> Optional[str]:
+        return self.last_captions.get(url)
+
+    def _store_caption(self, url: str, caption: Optional[str]) -> None:
+        if caption and caption.strip():
+            self.last_captions[url] = caption.strip()
+            if len(self.last_captions) > 300:
+                oldest_key = next(iter(self.last_captions))
+                self.last_captions.pop(oldest_key, None)
+
+    def resolve_share_url(self, url: str) -> str:
+        """
+        Resolves redirect chains for Instagram /share/, Facebook /share/ & fb.watch, and TikTok short links.
+        """
+        lower = url.lower()
+        if any(tok in lower for tok in ("/share/", "fb.watch/", "vm.tiktok.com/", "vt.tiktok.com/", "/t/")):
+            try:
+                with httpx.Client(follow_redirects=True, timeout=12.0, headers=IFRAME_EMBED_HEADERS) as client:
+                    resp = client.get(url)
+                    resolved = str(resp.url)
+                    if is_safe_social_url(resolved):
+                        return resolved
+            except Exception as e:
+                logger.debug(f"Could not resolve share URL {url}: {e}")
+        return url
+
     def download_media(self, url: str) -> Tuple[bool, List[Tuple[str, str]], str]:
         """
-        Downloads media (video, single image, or image carousel) from Instagram, TikTok, or YouTube.
+        Downloads media (video, single image, or multi-slide photo/video carousel) from
+        Instagram, TikTok, Facebook, or YouTube.
         Returns:
             (success, media_items, message)
             where media_items is a list of (media_type, file_path) tuples ("video" or "photo").
         """
-        # First attempt video download via yt-dlp
-        success, video_path, message = self.download(url)
+        if not is_safe_social_url(url):
+            return False, [], "Unsupported or unsafe URL domain."
+
+        resolved_url = self.resolve_share_url(url)
+        is_ig = any(d in resolved_url.lower() for d in ("instagram.com", "instagr.am"))
+        is_ig_post = is_ig and "/p/" in resolved_url.lower()
+
+        # 1. For Instagram /p/ posts (single images & multi-slide carousels), try iframe embed extraction first
+        # so full-scale uncropped carousels and mixed photo/video slides are preserved intact.
+        if is_ig_post:
+            ig_ok, ig_items, ig_msg = self._download_instagram_embed(url, resolved_url)
+            if ig_ok and ig_items:
+                return True, ig_items, ig_msg
+
+        # 2. Attempt video download via yt-dlp (Reels, TikTok, Facebook, YouTube, or fallback)
+        success, video_path, message = self.download(resolved_url, original_url=url)
         if success and video_path:
             return True, [("video", video_path)], message
 
-        # If yt-dlp failed on an Instagram or TikTok link (e.g. "No video formats found" for an image post),
-        # try extracting image(s) via gallery-dl / Instagram embed / OpenGraph fallback.
-        if any(domain in url.lower() for domain in ("instagram.com", "instagr.am", "tiktok.com")):
-            logger.info(f"yt-dlp did not return video for {url} ({message}). Attempting image extraction...")
-            img_success, img_paths, img_msg = self.download_images(url)
+        # 3. If yt-dlp failed on an Instagram Reel/Post (e.g., anonymous GraphQL 401 login wall) or TikTok photo post,
+        # fall back to Instagram iframe embed extraction + gallery-dl.
+        if is_ig:
+            logger.info(f"yt-dlp did not return media for Instagram URL {resolved_url} ({message}). Trying iframe embed fallback...")
+            ig_ok, ig_items, ig_msg = self._download_instagram_embed(url, resolved_url)
+            if ig_ok and ig_items:
+                return True, ig_items, ig_msg
+
+        if any(domain in resolved_url.lower() for domain in ("instagram.com", "instagr.am", "tiktok.com")):
+            logger.info(f"Attempting image extraction for {resolved_url}...")
+            img_success, img_paths, img_msg = self.download_images(resolved_url, original_url=url)
             if img_success and img_paths:
                 return True, [("photo", p) for p in img_paths], "Image download successful."
 
         return False, [], message
 
-    def download(self, url: str) -> Tuple[bool, Optional[str], str]:
+    def download(self, url: str, original_url: Optional[str] = None) -> Tuple[bool, Optional[str], str]:
         """
-        Downloads a video from Instagram, TikTok, or YouTube using yt-dlp.
+        Downloads a video from Instagram, TikTok, Facebook, or YouTube using yt-dlp.
         Returns:
             (success, file_path, message)
         """
@@ -84,8 +145,11 @@ class DownloaderService:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+                caption_text = info.get("description") or info.get("title")
+                self._store_caption(original_url or url, caption_text)
+                self._store_caption(url, caption_text)
+
                 if "entries" in info and info["entries"]:
-                    # If playlist/carousel with video entries, pick the first video entry
                     entries = [e for e in info["entries"] if e]
                     if not entries:
                         return False, None, "No downloadable media entries found."
@@ -125,10 +189,194 @@ class DownloaderService:
             logger.exception("Unexpected error during download:")
             return False, None, f"Unexpected downloader error: {str(e)}"
 
-    def download_images(self, url: str) -> Tuple[bool, List[str], str]:
+    @staticmethod
+    def _uncrop_instagram_url(url: str) -> str:
+        """
+        Strips square crop (c<x>.<y>.<w>.<h>a) and downscale (s640x640, p640x640) directives
+        from Instagram CDN image URLs so the full-resolution uncropped image is returned.
+        """
+        # 1. Clean path segments like /s640x640/ or /c0.180.1440.1440a/
+        cleaned = re.sub(r"/(?:[sp]\d+x\d+|c\d+\.\d+\.\d+\.\d+a)(?=/)", "", url)
+
+        # 2. Clean tokens inside stp= query parameter (e.g., stp=c288.0.864.864a_dst-jpg_e35_s640x640_tt6)
+        def _clean_stp(match: re.Match) -> str:
+            raw_stp = match.group(1)
+            tokens = [
+                t
+                for t in raw_stp.split("_")
+                if not re.match(r"^(?:c\d+\.\d+\.\d+\.\d+a|[sp]\d+x\d+)$", t)
+            ]
+            return f"stp={'_'.join(tokens)}" if tokens else ""
+
+        cleaned = re.sub(r"stp=([^&\"'\s]+)", _clean_stp, cleaned)
+        return cleaned
+
+    @staticmethod
+    def _extract_context_data_from_embed_html(page: str) -> dict:
+        """
+        Extracts shortcode_media dict from Instagram embed HTML (either window.__additionalDataLoaded or contextJSON).
+        """
+        data = {}
+        add_match = re.search(r"window\.__additionalDataLoaded\([^,]+,\s*(\{.*?\})\);", page)
+        if add_match:
+            try:
+                data = json.loads(add_match.group(1))
+            except Exception:
+                data = {}
+
+        if not data:
+            ctx_match = re.search(r'"contextJSON"\s*:\s*"((?:\\.|[^"\\])*)"', page)
+            if ctx_match:
+                try:
+                    raw_json = json.loads(f'"{ctx_match.group(1)}"')
+                    data = json.loads(raw_json)
+                except Exception as e:
+                    logger.debug(f"Failed parsing contextJSON: {e}")
+
+        if isinstance(data, dict):
+            return (
+                data.get("gql_data", {}).get("shortcode_media")
+                or data.get("graphql", {}).get("shortcode_media")
+                or data.get("shortcode_media")
+                or {}
+            )
+        return {}
+
+    @classmethod
+    def _best_image_from_node(cls, node: dict) -> Optional[str]:
+        resources = node.get("display_resources")
+        if isinstance(resources, list) and resources:
+            best = max(resources, key=lambda r: r.get("config_width", 0) if isinstance(r, dict) else 0)
+            if isinstance(best, dict) and best.get("src"):
+                return cls._uncrop_instagram_url(best["src"])
+        if node.get("display_url"):
+            return cls._uncrop_instagram_url(node["display_url"])
+        if node.get("thumbnail_src"):
+            return cls._uncrop_instagram_url(node["thumbnail_src"])
+        return None
+
+    @classmethod
+    def _parse_instagram_embed_html(cls, page: str) -> List[Tuple[str, str]]:
+        """
+        Parses Instagram's /embed/captioned/ HTML and returns an ordered list of
+        ("photo" | "video", direct_url) items at full uncropped resolution.
+        """
+        items: List[Tuple[str, str]] = []
+        media = cls._extract_context_data_from_embed_html(page)
+
+        if media:
+            sidecar = media.get("edge_sidecar_to_children", {}).get("edges", [])
+            if sidecar:
+                for edge in sidecar:
+                    node = edge.get("node", {}) if isinstance(edge, dict) else {}
+                    if node.get("is_video") and node.get("video_url"):
+                        items.append(("video", node["video_url"]))
+                    else:
+                        img_url = cls._best_image_from_node(node)
+                        if img_url:
+                            items.append(("photo", img_url))
+            elif media.get("is_video") and media.get("video_url"):
+                items.append(("video", media["video_url"]))
+            else:
+                img_url = cls._best_image_from_node(media)
+                if img_url:
+                    items.append(("photo", img_url))
+
+        # Fallback: single image post where Instagram sets contextJSON: null and renders EmbeddedMediaImage
+        if not items:
+            for img_match in re.finditer(
+                r'<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"', page
+            ):
+                clean_url = cls._uncrop_instagram_url(html.unescape(img_match.group(1)))
+                if ("photo", clean_url) not in items:
+                    items.append(("photo", clean_url))
+
+        return items
+
+    @classmethod
+    def _extract_caption_from_embed_html(cls, page: str) -> Optional[str]:
+        """
+        Extracts the post caption text from Instagram embed contextJSON or the <div class="Caption"> HTML block.
+        """
+        media = cls._extract_context_data_from_embed_html(page)
+        if media:
+            edges = media.get("edge_media_to_caption", {}).get("edges", [])
+            if edges and isinstance(edges[0], dict):
+                text = edges[0].get("node", {}).get("text")
+                if text and text.strip():
+                    return text.strip()
+            if isinstance(media.get("caption"), str) and media["caption"].strip():
+                return media["caption"].strip()
+
+        cap_match = re.search(r'<div class="Caption">(.*?)</div>', page, re.DOTALL)
+        if cap_match:
+            raw_cap = cap_match.group(1)
+            raw_cap = re.sub(r'<a class="CaptionUsername"[^>]*>.*?</a>', "", raw_cap, flags=re.DOTALL)
+            raw_cap = re.sub(r'<div class="CaptionComments">.*', "", raw_cap, flags=re.DOTALL)
+            raw_cap = re.sub(r"<br\s*/?>", "\n", raw_cap, flags=re.IGNORECASE)
+            clean_cap = html.unescape(re.sub(r"<[^>]+>", "", raw_cap)).strip()
+            if clean_cap:
+                return clean_cap
+
+        return None
+
+    def _download_instagram_embed(
+        self, original_url: str, resolved_url: str
+    ) -> Tuple[bool, List[Tuple[str, str]], str]:
+        """
+        Fetches Instagram's /embed/captioned/ with Sec-Fetch-Dest: iframe headers, extracts
+        all uncropped photos/videos and caption, and downloads them to temp_dir.
+        """
+        m = re.search(r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", resolved_url)
+        if not m:
+            return False, [], "Could not parse Instagram shortcode."
+
+        shortcode = m.group(1)
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        job_id = uuid.uuid4().hex[:8]
+        saved_items: List[Tuple[str, str]] = []
+
+        try:
+            with httpx.Client(follow_redirects=True, timeout=20.0, headers=IFRAME_EMBED_HEADERS) as client:
+                resp = client.get(embed_url)
+                if resp.status_code != 200:
+                    return False, [], f"Instagram embed returned HTTP {resp.status_code}."
+
+                page = resp.text
+                caption = self._extract_caption_from_embed_html(page)
+                self._store_caption(original_url, caption)
+                self._store_caption(resolved_url, caption)
+
+                media_specs = self._parse_instagram_embed_html(page)
+                if not media_specs:
+                    return False, [], "No media items found in Instagram embed."
+
+                dl_headers = {
+                    "User-Agent": IFRAME_EMBED_HEADERS["User-Agent"],
+                    "Referer": "https://www.instagram.com/",
+                }
+                for idx, (m_type, m_url) in enumerate(media_specs[:10]):
+                    ext = ".mp4" if m_type == "video" else ".jpg"
+                    media_resp = client.get(m_url, headers=dl_headers)
+                    if media_resp.status_code == 200 and media_resp.content:
+                        if len(media_resp.content) > 50 * 1024 * 1024:
+                            continue
+                        out_path = os.path.join(self.temp_dir, f"ig_{job_id}_{idx}{ext}")
+                        with open(out_path, "wb") as f:
+                            f.write(media_resp.content)
+                        saved_items.append((m_type, out_path))
+
+            if saved_items:
+                return True, saved_items, "Downloaded via Instagram iframe embed."
+        except Exception as e:
+            logger.exception(f"Instagram iframe embed extraction failed for {resolved_url}: {e}")
+
+        return False, [], "Failed to download media from Instagram embed."
+
+    def download_images(self, url: str, original_url: Optional[str] = None) -> Tuple[bool, List[str], str]:
         """
         Extracts and downloads image(s) from an Instagram post/carousel or TikTok photo post.
-        Uses gallery-dl first, then falls back to Instagram's /embed/captioned/ endpoint and OpenGraph tags.
+        Uses gallery-dl first, then falls back to Instagram's /embed/captioned/ endpoint.
         """
         job_id = uuid.uuid4().hex[:8]
         job_dir = os.path.join(self.temp_dir, f"img_{job_id}")
@@ -160,36 +408,12 @@ class DownloaderService:
             except Exception as e:
                 logger.warning(f"gallery-dl failed for {url}: {e}")
 
-        # 2. Fallback: Resolve redirects and scrape Instagram embed / OpenGraph image URLs
-        try:
-            image_urls = self._extract_instagram_image_urls(url)
-            if image_urls:
-                saved_paths = []
-                with httpx.Client(follow_redirects=True, timeout=20.0) as client:
-                    for idx, img_url in enumerate(image_urls[:10]):
-                        resp = client.get(
-                            img_url,
-                            headers={
-                                "User-Agent": (
-                                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                                ),
-                                "Referer": "https://www.instagram.com/",
-                            },
-                        )
-                        if resp.status_code == 200 and resp.content:
-                            out_path = os.path.join(self.temp_dir, f"ig_{job_id}_{idx}.jpg")
-                            with open(out_path, "wb") as f:
-                                f.write(resp.content)
-                            saved_paths.append(out_path)
-
-                shutil.rmtree(job_dir, ignore_errors=True)
-                if saved_paths:
-                    return True, saved_paths, "Downloaded via Instagram embed fallback."
-        except Exception as e:
-            logger.exception(f"Fallback image extraction failed for {url}: {e}")
-
+        # 2. Fallback: Instagram iframe embed extractor
         shutil.rmtree(job_dir, ignore_errors=True)
+        ok, items, msg = self._download_instagram_embed(original_url or url, url)
+        if ok and items:
+            return True, [p for _, p in items], msg
+
         return False, [], "Could not extract images from link."
 
     def _move_job_files(self, files: List[str], job_dir: str, job_id: str) -> List[str]:
@@ -201,81 +425,6 @@ class DownloaderService:
             final_files.append(dest)
         shutil.rmtree(job_dir, ignore_errors=True)
         return final_files
-
-    def _extract_instagram_image_urls(self, url: str) -> List[str]:
-        """
-        Resolves Instagram URLs (including /share/ links) and extracts high-res image URLs
-        from Instagram's public /embed/captioned/ endpoint or OpenGraph meta tags.
-        """
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        image_urls: List[str] = []
-
-        with httpx.Client(follow_redirects=True, timeout=15.0, headers=headers) as client:
-            # Resolve /share/ or short links first
-            try:
-                head_resp = client.get(url)
-                resolved_url = str(head_resp.url)
-            except Exception:
-                resolved_url = url
-
-            # Extract shortcode from URL
-            m = re.search(r"instagram\.com/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", resolved_url)
-            shortcode = m.group(1) if m else None
-
-            if shortcode:
-                embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-                resp = client.get(embed_url)
-                if resp.status_code == 200:
-                    page = resp.text
-                    # Check for contextJSON inside the embed page (contains full carousel slides)
-                    ctx_match = re.search(r'window\.__additionalDataLoaded\([^,]+,\s*(\{.*?\})\);', page)
-                    if not ctx_match:
-                        ctx_match = re.search(r'"contextJSON"\s*:\s*"((?:\\.|[^"\\])*)"', page)
-                        if ctx_match:
-                            try:
-                                raw_json = json.loads(f'"{ctx_match.group(1)}"')
-                                data = json.loads(raw_json)
-                                media = data.get("gql_data", {}).get("shortcode_media") or data.get("shortcode_media") or {}
-                                sidecar = media.get("edge_sidecar_to_children", {}).get("edges", [])
-                                if sidecar:
-                                    for edge in sidecar:
-                                        node = edge.get("node", {})
-                                        if not node.get("is_video") and node.get("display_url"):
-                                            image_urls.append(node["display_url"])
-                                elif media.get("display_url"):
-                                    image_urls.append(media["display_url"])
-                            except Exception as e:
-                                logger.debug(f"Failed parsing contextJSON: {e}")
-
-                    # Fallback to EmbeddedMediaImage img tags in the embed HTML
-                    if not image_urls:
-                        for img_match in re.finditer(
-                            r'<img[^>]+class="[^"]*EmbeddedMediaImage[^"]*"[^>]+src="([^"]+)"', page
-                        ):
-                            clean_url = html.unescape(img_match.group(1))
-                            if clean_url not in image_urls:
-                                image_urls.append(clean_url)
-
-            # 3. Last resort: OpenGraph og:image via crawler User-Agent
-            if not image_urls:
-                crawler_resp = client.get(
-                    resolved_url,
-                    headers={"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"},
-                )
-                if crawler_resp.status_code == 200:
-                    og_match = re.search(
-                        r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', crawler_resp.text, re.IGNORECASE
-                    )
-                    if og_match:
-                        image_urls.append(html.unescape(og_match.group(1)))
-
-        return image_urls
 
     def optimize_video(self, input_path: str) -> Tuple[str, bool]:
         """

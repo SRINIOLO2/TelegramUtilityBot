@@ -1,48 +1,33 @@
 import asyncio
-import hashlib
+import html
 import logging
 import os
 import re
-from typing import Optional
+from typing import List, Optional, Tuple
 from telegram import (
-    Update,
-    Message,
-    InlineKeyboardMarkup,
+    CallbackQuery,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQueryResultArticle,
-    InputTextMessageContent,
-    InputMediaVideo,
     InputMediaPhoto,
+    InputMediaVideo,
+    InputTextMessageContent,
+    LinkPreviewOptions,
+    Message,
+    Update,
 )
 from telegram.ext import ContextTypes
+from services.cache import MediaCache
 from services.downloader import DownloaderService
+from services.url_patterns import (
+    AUTO_LINK_PATTERN,
+    SOCIAL_LINK_PATTERN,
+    YOUTUBE_LINK_PATTERN,
+    get_platform_label,
+    is_safe_social_url,
+)
 
 logger = logging.getLogger(__name__)
-
-# Auto-detected links (Instagram Reels/Posts/Shares/Stories and TikTok Videos/Photos)
-AUTO_LINK_PATTERN = re.compile(
-    r"(https?://(?:www\.)?instagram\.com/(?:[A-Za-z0-9._]+/)?(?:p|reel|reels|tv)/[A-Za-z0-9-_]+"
-    r"|https?://(?:www\.)?instagram\.com/share/(?:(?:p|reel|reels|tv)/)?[A-Za-z0-9-_]+"
-    r"|https?://(?:www\.)?instagram\.com/stories/[A-Za-z0-9._]+/[0-9]+"
-    r"|https?://instagr\.am/p/[A-Za-z0-9-_]+"
-    r"|https?://(?:www\.)?tiktok\.com/@[A-Za-z0-9._-]+/(?:video|photo)/[0-9]+"
-    r"|https?://(?:www\.)?tiktok\.com/t/[A-Za-z0-9_-]+"
-    r"|https?://(?:vm|vt|v|m)\.tiktok\.com/(?:v/)?[A-Za-z0-9_-]+)",
-    re.IGNORECASE,
-)
-
-# Manual-only links (YouTube Watch, Shorts, Live, and youtu.be)
-YOUTUBE_LINK_PATTERN = re.compile(
-    r"(https?://(?:(?:www|m)\.)?youtube\.com/(?:watch\?[^\s\"'<>]*v=|shorts/|live/)[A-Za-z0-9_-]+"
-    r"|https?://youtu\.be/[A-Za-z0-9_-]+)",
-    re.IGNORECASE,
-)
-
-# Combined pattern for manual commands (/dl), bot mentions (@metahaterbot), and inline queries
-SOCIAL_LINK_PATTERN = re.compile(
-    f"{AUTO_LINK_PATTERN.pattern}|{YOUTUBE_LINK_PATTERN.pattern}",
-    re.IGNORECASE,
-)
 
 EPHEMERAL_TIMEOUT_SECONDS = 45
 
@@ -50,16 +35,21 @@ EPHEMERAL_TIMEOUT_SECONDS = 45
 class VideoHandler:
     def __init__(self, downloader_service: DownloaderService):
         self.downloader = downloader_service
-        # Cache to store the URL mapped to the message ID or callback query hash
-        self.url_cache = {}
-        # Store recent links per user for quick inline access
-        self.recent_user_links = {}
+        self.cache = MediaCache(max_entries=500)
+        # Alias for backward compatibility with existing tests/callers
+        self.url_cache = self.cache
         # Track prompt message IDs that have been clicked so ephemeral auto-delete skips them
         self.claimed_prompts = set()
 
-        # Concurrency protections
-        self.global_semaphore = asyncio.Semaphore(3)
+        # Concurrency protections (lazily initialized on the active event loop)
+        self._global_semaphore: Optional[asyncio.Semaphore] = None
         self.user_locks = {}
+
+    @property
+    def global_semaphore(self) -> asyncio.Semaphore:
+        if self._global_semaphore is None:
+            self._global_semaphore = asyncio.Semaphore(3)
+        return self._global_semaphore
 
     def get_user_lock(self, user_id: int) -> asyncio.Lock:
         if user_id not in self.user_locks:
@@ -67,12 +57,49 @@ class VideoHandler:
         return self.user_locks[user_id]
 
     def save_user_link(self, user_id: int, url: str) -> None:
-        if user_id not in self.recent_user_links:
-            self.recent_user_links[user_id] = []
-        if url in self.recent_user_links[user_id]:
-            self.recent_user_links[user_id].remove(url)
-        self.recent_user_links[user_id].insert(0, url)
-        self.recent_user_links[user_id] = self.recent_user_links[user_id][:5]
+        self.cache.save_user_link(user_id, url)
+
+    @staticmethod
+    def _get_platform_label(url: str) -> str:
+        return get_platform_label(url)
+
+    @staticmethod
+    def format_expandable_caption(caption: Optional[str]) -> Optional[str]:
+        """
+        Formats media post caption as an expandable Telegram blockquote (<blockquote expandable>...</blockquote>)
+        using HTML parse mode, safely escaping entities and enforcing Telegram's 1,024-character media caption limit.
+        """
+        if not caption or not caption.strip():
+            return None
+
+        cleaned = caption.strip()
+        if len(cleaned) > 900:
+            cleaned = cleaned[:900].rstrip() + "…"
+
+        escaped = html.escape(cleaned)
+        # Guard in case HTML entity expansion pushes length near 1024
+        max_inner = 1024 - len("<blockquote expandable>…</blockquote>")
+        if len(escaped) > max_inner:
+            escaped = escaped[:max_inner] + "…"
+
+        return f"<blockquote expandable>{escaped}</blockquote>"
+
+    @staticmethod
+    def build_carousel_pager_keyboard(url_hash: str, current_idx: int, total: int) -> InlineKeyboardMarkup:
+        """
+        Builds an interactive 1-on-1 inline pager keyboard: [ ◀️ Prev ] [ 1 / N ] [ Next ▶️ ]
+        with wrap-around navigation.
+        """
+        prev_idx = (current_idx - 1) % total
+        next_idx = (current_idx + 1) % total
+        keyboard = [
+            [
+                InlineKeyboardButton("◀️ Prev", callback_data=f"page_{url_hash}_{prev_idx}"),
+                InlineKeyboardButton(f"{current_idx + 1} / {total}", callback_data="noop"),
+                InlineKeyboardButton("Next ▶️", callback_data=f"page_{url_hash}_{next_idx}"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
 
     @staticmethod
     def _extract_url_from_message(msg: Optional[Message], pattern: re.Pattern) -> Optional[str]:
@@ -84,7 +111,9 @@ class VideoHandler:
             if content:
                 match = pattern.search(content)
                 if match:
-                    return match.group(0)
+                    url = match.group(0)
+                    if is_safe_social_url(url):
+                        return url
 
         # 2. Check hyperlink entities (text_link / url)
         for entities in (msg.entities, msg.caption_entities):
@@ -93,22 +122,15 @@ class VideoHandler:
                     if ent.url:
                         match = pattern.search(ent.url)
                         if match:
-                            return match.group(0)
+                            url = match.group(0)
+                            if is_safe_social_url(url):
+                                return url
 
         return None
 
-    @staticmethod
-    def _get_platform_label(url: str) -> str:
-        lower = url.lower()
-        if "instagram.com" in lower or "instagr.am" in lower:
-            return "Instagram"
-        if "tiktok.com" in lower:
-            return "TikTok"
-        if "youtube.com" in lower or "youtu.be" in lower:
-            return "YouTube"
-        return "Media"
-
-    async def _auto_delete_prompt(self, reply_msg: Message, prompt_key: str, delay: int = EPHEMERAL_TIMEOUT_SECONDS) -> None:
+    async def _auto_delete_prompt(
+        self, reply_msg: Message, prompt_key: str, delay: int = EPHEMERAL_TIMEOUT_SECONDS
+    ) -> None:
         """
         Deletes the ephemeral download prompt after `delay` seconds if the user hasn't clicked Download.
         """
@@ -123,7 +145,7 @@ class VideoHandler:
     async def handle_inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Handles inline queries so users can type @metahaterbot <link> or just @metahaterbot in any 1-on-1 chat.
-        Supports Instagram, TikTok, and YouTube links.
+        Supports Instagram, TikTok, Facebook, and YouTube links.
         """
         if not update.inline_query:
             return
@@ -132,42 +154,42 @@ class VideoHandler:
         user_id = update.inline_query.from_user.id
         results = []
 
-        # Case 1: User pasted a link (Instagram, TikTok, or YouTube) in the inline query
+        # Case 1: User pasted a supported link in the inline query
         if query:
             match = SOCIAL_LINK_PATTERN.search(query)
             if match:
                 url = match.group(0)
-                platform = self._get_platform_label(url)
-                self.save_user_link(user_id, url)
-                url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-                self.url_cache[url_hash] = url
+                if is_safe_social_url(url):
+                    platform = self._get_platform_label(url)
+                    self.save_user_link(user_id, url)
+                    url_hash = self.cache.store_url(url)
 
-                keyboard = [
-                    [InlineKeyboardButton(f"📥 Download {platform} Media", callback_data=f"dl_{url_hash}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Load {platform} Media", callback_data=f"dl_{url_hash}")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
 
-                results.append(
-                    InlineQueryResultArticle(
-                        id=url_hash,
-                        title=f"📥 Download {platform} Media",
-                        description=f"Click to post & download in this chat: {url[:45]}...",
-                        input_message_content=InputTextMessageContent(
-                            f"🔗 *{platform} Link:*\n{url}\n\n_Tap below to load media directly into this chat._",
-                            parse_mode="Markdown",
-                        ),
-                        reply_markup=reply_markup,
+                    results.append(
+                        InlineQueryResultArticle(
+                            id=url_hash,
+                            title=f"📥 Load {platform} Media in Chat",
+                            description=f"Tap to embed video/carousel here: {url[:45]}...",
+                            input_message_content=InputTextMessageContent(
+                                f"🔗 *{platform} Link*\n{url}\n\n_Tap below to load media directly into this chat._",
+                                parse_mode="Markdown",
+                                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                            ),
+                            reply_markup=reply_markup,
+                        )
                     )
-                )
 
         # Case 2: User opened @metahaterbot with empty/non-matching query -> show recent links
-        if not results and user_id in self.recent_user_links:
-            for idx, url in enumerate(self.recent_user_links[user_id]):
+        if not results:
+            for idx, url in enumerate(self.cache.get_user_links(user_id)):
                 platform = self._get_platform_label(url)
-                url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-                self.url_cache[url_hash] = url
+                url_hash = self.cache.store_url(url)
                 keyboard = [
-                    [InlineKeyboardButton(f"📥 Download {platform} Media", callback_data=f"dl_{url_hash}")]
+                    [InlineKeyboardButton(f"📥 Load {platform} Media", callback_data=f"dl_{url_hash}")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -177,8 +199,9 @@ class VideoHandler:
                         title=f"🕒 Recent {platform} Link #{idx + 1}",
                         description=f"{url[:50]}...",
                         input_message_content=InputTextMessageContent(
-                            f"🔗 *{platform} Link:*\n{url}\n\n_Tap below to load media directly into this chat._",
+                            f"🔗 *{platform} Link*\n{url}\n\n_Tap below to load media directly into this chat._",
                             parse_mode="Markdown",
+                            link_preview_options=LinkPreviewOptions(is_disabled=True),
                         ),
                         reply_markup=reply_markup,
                     )
@@ -189,7 +212,7 @@ class VideoHandler:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Scans messages for links:
-        - Auto-detects Instagram & TikTok links with a 45s ephemeral prompt.
+        - Auto-detects Instagram, TikTok, and Facebook links with a 45s ephemeral prompt.
         - Detects YouTube (and replied-to links) when manually invoked via /dl, /download, or @metahaterbot.
         """
         msg = update.effective_message
@@ -208,15 +231,13 @@ class VideoHandler:
         target_msg = msg
 
         if is_manual_call:
-            # Manual call: check current message first, then replied-to message, supporting YouTube + IG + TikTok
             url = self._extract_url_from_message(msg, SOCIAL_LINK_PATTERN)
             if not url and msg.reply_to_message:
                 url = self._extract_url_from_message(msg.reply_to_message, SOCIAL_LINK_PATTERN)
                 target_msg = msg.reply_to_message
         else:
-            # Automatic passive detection: only Instagram & TikTok (never auto-prompt on YouTube)
+            # Automatic passive detection: Instagram, TikTok & Facebook (never auto-prompt on YouTube)
             url = self._extract_url_from_message(msg, AUTO_LINK_PATTERN)
-            # Also support replying to an IG/TikTok link in DM
             if not url and msg.reply_to_message and msg.chat.type == "private":
                 url = self._extract_url_from_message(msg.reply_to_message, AUTO_LINK_PATTERN)
                 target_msg = msg.reply_to_message
@@ -224,7 +245,7 @@ class VideoHandler:
         if not url:
             if text.lower().startswith(("/dl", "/download")):
                 await msg.reply_text(
-                    "⚠️ No supported link found. Reply `/dl` to a message containing an Instagram, TikTok, or YouTube link, or send `/dl <link>`.",
+                    "⚠️ No supported link found. Reply `/dl` to a message containing an Instagram, TikTok, Facebook, or YouTube link, or send `/dl <link>`.",
                     parse_mode="Markdown",
                 )
             return
@@ -236,8 +257,7 @@ class VideoHandler:
         if user_id:
             self.save_user_link(user_id, url)
 
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-        self.url_cache[url_hash] = url
+        url_hash = self.cache.store_url(url)
 
         keyboard = [
             [
@@ -260,15 +280,133 @@ class VideoHandler:
         )
 
         prompt_key = f"{reply_msg.chat_id}_{reply_msg.message_id}"
-        self.url_cache[str(reply_msg.message_id)] = url
+        self.cache.bind_message(reply_msg.message_id, url)
 
-        # Schedule ephemeral auto-delete if this was an automatic prompt
         if not is_manual_call:
             asyncio.create_task(self._auto_delete_prompt(reply_msg, prompt_key, delay=EPHEMERAL_TIMEOUT_SECONDS))
 
+    async def _handle_carousel_page(
+        self, query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, url_hash: str, target_idx: int
+    ) -> None:
+        """
+        Flips to the requested slide index in a 1-on-1 inline carousel message using cached Telegram file_ids.
+        """
+        slides = self.cache.get_media_files(url_hash)
+        if not slides:
+            await query.answer("❌ Carousel cache expired. Please re-send the link.", show_alert=True)
+            return
+
+        total = len(slides)
+        idx = target_idx % total
+        m_type, file_id = slides[idx]
+        formatted_caption = self.format_expandable_caption(self.cache.get_caption(url_hash))
+        pager_kb = self.build_carousel_pager_keyboard(url_hash, idx, total)
+
+        if m_type == "video":
+            media_obj = InputMediaVideo(
+                media=file_id,
+                caption=formatted_caption,
+                parse_mode="HTML" if formatted_caption else None,
+                supports_streaming=True,
+            )
+        else:
+            media_obj = InputMediaPhoto(
+                media=file_id,
+                caption=formatted_caption,
+                parse_mode="HTML" if formatted_caption else None,
+            )
+
+        try:
+            await query.answer(f"Slide {idx + 1} of {total}")
+            if query.inline_message_id:
+                await context.bot.edit_message_media(
+                    inline_message_id=query.inline_message_id,
+                    media=media_obj,
+                    reply_markup=pager_kb,
+                )
+            elif query.message:
+                await query.edit_message_media(
+                    media=media_obj,
+                    reply_markup=pager_kb,
+                )
+        except Exception as e:
+            logger.debug(f"Carousel page update skipped: {e}")
+
+    async def _deliver_from_cache(
+        self,
+        query: CallbackQuery,
+        context: ContextTypes.DEFAULT_TYPE,
+        url_hash: str,
+        cached_slides: List[Tuple[str, str]],
+        formatted_caption: Optional[str],
+    ) -> None:
+        """
+        Instantly delivers media from cached Telegram file_ids without re-downloading.
+        """
+        if query.message:
+            target_msg = query.message.reply_to_message or query.message
+            if len(cached_slides) == 1:
+                m_type, file_id = cached_slides[0]
+                if m_type == "video":
+                    await target_msg.reply_video(
+                        video=file_id,
+                        caption=formatted_caption,
+                        parse_mode="HTML" if formatted_caption else None,
+                        supports_streaming=True,
+                    )
+                else:
+                    await target_msg.reply_photo(
+                        photo=file_id,
+                        caption=formatted_caption,
+                        parse_mode="HTML" if formatted_caption else None,
+                    )
+            else:
+                media_group = []
+                for idx, (m_type, file_id) in enumerate(cached_slides[:10]):
+                    cap = formatted_caption if idx == 0 else None
+                    pm = "HTML" if cap else None
+                    if m_type == "video":
+                        media_group.append(
+                            InputMediaVideo(media=file_id, caption=cap, parse_mode=pm, supports_streaming=True)
+                        )
+                    else:
+                        media_group.append(InputMediaPhoto(media=file_id, caption=cap, parse_mode=pm))
+                await target_msg.reply_media_group(media=media_group)
+
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+
+        elif query.inline_message_id:
+            m_type, file_id = cached_slides[0]
+            pager_kb = (
+                self.build_carousel_pager_keyboard(url_hash, 0, len(cached_slides))
+                if len(cached_slides) > 1
+                else None
+            )
+            if m_type == "video":
+                media_obj = InputMediaVideo(
+                    media=file_id,
+                    caption=formatted_caption,
+                    parse_mode="HTML" if formatted_caption else None,
+                    supports_streaming=True,
+                )
+            else:
+                media_obj = InputMediaPhoto(
+                    media=file_id,
+                    caption=formatted_caption,
+                    parse_mode="HTML" if formatted_caption else None,
+                )
+            await context.bot.edit_message_media(
+                inline_message_id=query.inline_message_id,
+                media=media_obj,
+                reply_markup=pager_kb,
+            )
+
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Handles inline button clicks for downloading media or dismissing the ephemeral prompt.
+        Handles inline button clicks for downloading media, flipping carousel slides, or dismissing prompts.
         """
         query = update.callback_query
         if not query:
@@ -276,7 +414,18 @@ class VideoHandler:
 
         data = query.data or ""
 
-        # Handle Dismiss button
+        if data == "noop":
+            await query.answer()
+            return
+
+        if data.startswith("page_"):
+            parts = data.split("_")
+            if len(parts) == 3 and parts[2].isdigit():
+                await self._handle_carousel_page(query, context, parts[1], int(parts[2]))
+            else:
+                await query.answer()
+            return
+
         if data.startswith("dismiss_"):
             if query.message:
                 prompt_key = f"{query.message.chat_id}_{query.message.message_id}"
@@ -290,24 +439,39 @@ class VideoHandler:
 
         # Resolve URL from callback data
         url = None
+        url_hash = None
         if data.startswith("dl_"):
             url_hash = data[3:]
-            url = self.url_cache.get(url_hash)
+            url = self.cache.get_url(url_hash)
         elif data == "download_video" and query.message:
             msg_id = str(query.message.message_id)
-            url = self.url_cache.get(msg_id)
+            url = self.cache.get_url(msg_id)
 
         if query.message:
             prompt_key = f"{query.message.chat_id}_{query.message.message_id}"
             self.claimed_prompts.add(prompt_key)
             if not url:
-                url = self.url_cache.get(str(query.message.message_id))
+                url = self.cache.get_url(str(query.message.message_id))
 
         user_id = query.from_user.id
 
         if not url:
             await query.answer("❌ Link expired or not found. Please send the link again.", show_alert=True)
             return
+
+        if not url_hash:
+            url_hash = self.cache.store_url(url)
+
+        # Fast path: deliver immediately if Telegram file_ids are already cached for this URL
+        cached_slides = self.cache.get_media_files(url_hash)
+        if cached_slides:
+            await query.answer("⚡ Loaded from cache!")
+            formatted_caption = self.format_expandable_caption(self.cache.get_caption(url_hash))
+            try:
+                await self._deliver_from_cache(query, context, url_hash, cached_slides, formatted_caption)
+                return
+            except Exception as e:
+                logger.warning(f"Cached file_id delivery failed, falling back to fresh download: {e}")
 
         user_lock = self.get_user_lock(user_id)
         if user_lock.locked():
@@ -351,12 +515,14 @@ class VideoHandler:
                     await update_status(f"❌ {message}")
                     return
 
+                raw_caption = self.downloader.get_caption(url)
+                formatted_caption = self.format_expandable_caption(raw_caption)
+
                 final_items = []
                 try:
-                    # Optimize any video items for mobile streaming
                     for media_type, raw_path in media_items:
                         if media_type == "video":
-                            await update_status("⚙️ Optimizing video for mobile (NVENC)...")
+                            await update_status("⚙️ Optimizing video for mobile...")
                             try:
                                 opt_path, _ = await asyncio.wait_for(
                                     loop.run_in_executor(None, self.downloader.optimize_video, raw_path),
@@ -373,6 +539,7 @@ class VideoHandler:
                             final_items.append((media_type, raw_path))
 
                     await update_status("📤 Uploading to Telegram...")
+                    uploaded_slides: List[Tuple[str, str]] = []
 
                     # Delivery Branch 1: Normal Chat or Group Chat
                     if query.message:
@@ -381,79 +548,127 @@ class VideoHandler:
                             m_type, f_path = final_items[0]
                             with open(f_path, "rb") as media_file:
                                 if m_type == "video":
-                                    await target_msg.reply_video(
+                                    sent = await target_msg.reply_video(
                                         video=media_file,
+                                        caption=formatted_caption,
+                                        parse_mode="HTML" if formatted_caption else None,
                                         supports_streaming=True,
                                         write_timeout=120,
                                     )
+                                    if sent and getattr(sent, "video", None):
+                                        uploaded_slides.append(("video", sent.video.file_id))
                                 else:
-                                    await target_msg.reply_photo(
+                                    sent = await target_msg.reply_photo(
                                         photo=media_file,
+                                        caption=formatted_caption,
+                                        parse_mode="HTML" if formatted_caption else None,
                                         write_timeout=120,
                                     )
+                                    if sent and getattr(sent, "photo", None):
+                                        uploaded_slides.append(("photo", sent.photo[-1].file_id))
                         else:
-                            # Multi-image carousel
                             media_group = []
                             open_files = []
                             try:
-                                for m_type, f_path in final_items[:10]:
+                                for idx, (m_type, f_path) in enumerate(final_items[:10]):
                                     f_obj = open(f_path, "rb")
                                     open_files.append(f_obj)
+                                    cap = formatted_caption if idx == 0 else None
+                                    pm = "HTML" if cap else None
                                     if m_type == "video":
-                                        media_group.append(InputMediaVideo(media=f_obj, supports_streaming=True))
+                                        media_group.append(
+                                            InputMediaVideo(
+                                                media=f_obj,
+                                                caption=cap,
+                                                parse_mode=pm,
+                                                supports_streaming=True,
+                                            )
+                                        )
                                     else:
-                                        media_group.append(InputMediaPhoto(media=f_obj))
-                                await target_msg.reply_media_group(media=media_group, write_timeout=120)
+                                        media_group.append(
+                                            InputMediaPhoto(media=f_obj, caption=cap, parse_mode=pm)
+                                        )
+                                sent_msgs = await target_msg.reply_media_group(
+                                    media=media_group, write_timeout=120
+                                )
+                                if sent_msgs:
+                                    for s_msg in sent_msgs:
+                                        if getattr(s_msg, "video", None):
+                                            uploaded_slides.append(("video", s_msg.video.file_id))
+                                        elif getattr(s_msg, "photo", None):
+                                            uploaded_slides.append(("photo", s_msg.photo[-1].file_id))
                             finally:
                                 for f_obj in open_files:
                                     f_obj.close()
+
+                        if uploaded_slides:
+                            self.cache.store_media_files(url_hash, uploaded_slides, caption=raw_caption)
 
                         try:
                             await query.message.delete()
                         except Exception:
                             pass
 
-                    # Delivery Branch 2: Inline Mode in 1-on-1 Chats -> Replace inline message in-place!
+                    # Delivery Branch 2: Inline Mode in 1-on-1 Chats -> Stage & Replace In-Place with Pager!
                     elif query.inline_message_id:
-                        m_type, f_path = final_items[0]
-                        with open(f_path, "rb") as media_file:
-                            if m_type == "video":
-                                staged_msg = await context.bot.send_video(
-                                    chat_id=user_id,
-                                    video=media_file,
+                        for idx, (m_type, f_path) in enumerate(final_items[:10]):
+                            if len(final_items) > 1:
+                                await update_status(f"📤 Preparing slide {idx + 1} of {min(len(final_items), 10)}...")
+                            with open(f_path, "rb") as media_file:
+                                if m_type == "video":
+                                    staged_msg = await context.bot.send_video(
+                                        chat_id=user_id,
+                                        video=media_file,
+                                        supports_streaming=True,
+                                        disable_notification=True,
+                                        write_timeout=120,
+                                    )
+                                    uploaded_slides.append(("video", staged_msg.video.file_id))
+                                else:
+                                    staged_msg = await context.bot.send_photo(
+                                        chat_id=user_id,
+                                        photo=media_file,
+                                        disable_notification=True,
+                                        write_timeout=120,
+                                    )
+                                    uploaded_slides.append(("photo", staged_msg.photo[-1].file_id))
+
+                            try:
+                                await staged_msg.delete()
+                            except Exception as del_err:
+                                logger.debug(f"Could not delete staging message: {del_err}")
+
+                        if uploaded_slides:
+                            self.cache.store_media_files(url_hash, uploaded_slides, caption=raw_caption)
+                            first_type, first_file_id = uploaded_slides[0]
+                            pager_kb = (
+                                self.build_carousel_pager_keyboard(url_hash, 0, len(uploaded_slides))
+                                if len(uploaded_slides) > 1
+                                else None
+                            )
+                            if first_type == "video":
+                                first_media = InputMediaVideo(
+                                    media=first_file_id,
+                                    caption=formatted_caption,
+                                    parse_mode="HTML" if formatted_caption else None,
                                     supports_streaming=True,
-                                    disable_notification=True,
-                                    write_timeout=120,
-                                )
-                                file_id = staged_msg.video.file_id
-                                await context.bot.edit_message_media(
-                                    inline_message_id=query.inline_message_id,
-                                    media=InputMediaVideo(media=file_id, supports_streaming=True),
                                 )
                             else:
-                                staged_msg = await context.bot.send_photo(
-                                    chat_id=user_id,
-                                    photo=media_file,
-                                    disable_notification=True,
-                                    write_timeout=120,
+                                first_media = InputMediaPhoto(
+                                    media=first_file_id,
+                                    caption=formatted_caption,
+                                    parse_mode="HTML" if formatted_caption else None,
                                 )
-                                file_id = staged_msg.photo[-1].file_id
-                                await context.bot.edit_message_media(
-                                    inline_message_id=query.inline_message_id,
-                                    media=InputMediaPhoto(media=file_id),
-                                )
-
-                        # Delete the temporary staging message from user's Bot DM so their Bot DM stays clean
-                        try:
-                            await staged_msg.delete()
-                        except Exception as del_err:
-                            logger.debug(f"Could not delete staging message: {del_err}")
+                            await context.bot.edit_message_media(
+                                inline_message_id=query.inline_message_id,
+                                media=first_media,
+                                reply_markup=pager_kb,
+                            )
 
                 except Exception as e:
                     logger.exception(f"Failed to upload media to Telegram: {e}")
                     await update_status(f"❌ Failed to upload media: {str(e)}")
                 finally:
-                    # Clean up all temporary files
                     for _, f_path in final_items:
                         if f_path and os.path.exists(f_path):
                             try:
