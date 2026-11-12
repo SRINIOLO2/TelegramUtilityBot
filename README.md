@@ -1,6 +1,6 @@
 # TelegramUtilityBot (`@metahaterbot`)
 
-A fast, lightweight Telegram utility bot that downloads and optimizes media from **Instagram**, **TikTok**, and **YouTube** for seamless inline mobile playback in Telegram—across direct DMs, group chats, and 1-on-1 private chats.
+A fast, modular Telegram utility bot that downloads, uncrops, and optimizes media from **Instagram**, **Facebook**, **TikTok**, and **YouTube** for seamless inline playback across iOS, Android, Desktop, and Web—in Bot DMs, group chats, and 1-on-1 private chats.
 
 ---
 
@@ -8,63 +8,66 @@ A fast, lightweight Telegram utility bot that downloads and optimizes media from
 
 ### 1. Supported Media & URLs
 - **Instagram**:
-  - Reels (`/reel/<id>`, `/reels/<id>`, `/<username>/reel/<id>`)
+  - Reels (`/reel/<id>`, `/reels/<id>`, `/<username>/reel/<id>`) with automatic iframe `contextJSON` fallback when anonymous GraphQL endpoints require login
   - Video & Photo Posts (`/p/<id>`, `/<username>/p/<id>`, `instagr.am/p/<id>`)
   - Mobile Share Links (`/share/<id>`, `/share/reel/<id>`, `/share/p/<id>`)
-  - Single Images & Multi-Image Carousels (automatically detected via `gallery-dl` and Instagram `/embed/captioned/` + OpenGraph fallback, delivered as native Telegram photos or albums)
+  - **Full-Scale Uncropped Images & Mixed Carousels**: Extracts highest-resolution `display_resources` and strips CDN square-crop (`c<x>.<y>.<w>.<h>a`) and resize (`s640x640`) directives across all slides (up to 10 photos/videos per post)
+- **Facebook**:
+  - Reels (`facebook.com/reel/<id>`, `facebook.com/share/r/<id>`)
+  - Watch & Page Videos (`facebook.com/watch/?v=<id>`, `facebook.com/<page>/videos/<id>`, `facebook.com/share/v/<id>`, `fb.watch/<id>`)
 - **TikTok**:
   - Videos (`/@username/video/<id>`, `/t/<id>`, `vm.tiktok.com/<id>`, `vt.tiktok.com/<id>`)
   - Photo Posts (`/@username/photo/<id>`)
-  - Browser TLS impersonation via `curl-cffi` to prevent rate-limiting
+  - Browser TLS impersonation via `curl-cffi`
 - **YouTube (Manual Trigger Only)**:
   - Standard Videos (`youtube.com/watch?v=<id>`, `youtu.be/<id>`)
-  - YouTube Shorts (`youtube.com/shorts/<id>`)
-  - Powered by `yt-dlp` with embedded `nodejs` runtime
+  - YouTube Shorts & Live (`youtube.com/shorts/<id>`, `youtube.com/live/<id>`)
 
 ---
 
 ## 📱 How to Use
 
 ### 1. Bot DM & Group Chats (Ephemeral Prompt)
-- Whenever an **Instagram** or **TikTok** link is sent in a chat (either in plain text, media captions, or hyperlink entities), the bot replies with a compact action bar:
-  `[ 📥 Download Instagram/TikTok ]  [ ✖️ Dismiss ]`
-- **45-Second Ephemeral Auto-Hide**: If the native Telegram embed already works and nobody clicks download within **45 seconds**, the bot automatically deletes its prompt message so the chat remains clutter-free.
+- Whenever an **Instagram**, **Facebook**, or **TikTok** link is sent in a chat (in plain text, media captions, or hyperlink entities), the bot replies with a compact action bar:
+  `[ 📥 Download <Platform> ]  [ ✖️ Dismiss ]`
+- **45-Second Ephemeral Auto-Hide**: If the native Telegram embed already works and nobody taps download within **45 seconds**, the bot automatically deletes its prompt so the chat stays clean.
 - Clicking **✖️ Dismiss** deletes the prompt immediately.
+- **Expandable Post Captions**: Downloaded videos, photos, and media albums automatically include the original post's text/caption inside a collapsible Telegram quote block (`<blockquote expandable>...</blockquote>`).
 
 ### 2. Manual Downloads & YouTube Links (`/dl` or `@metahaterbot`)
-To avoid spamming chats when YouTube native embeds work, **YouTube links do not trigger automatic ephemeral prompts**. You can manually download any YouTube, Instagram, or TikTok link by:
+To avoid cluttering chats when YouTube native embeds work, **YouTube links do not trigger automatic ephemeral prompts**. Manually download any YouTube, Instagram, Facebook, or TikTok link by:
 - Sending `/dl <link>` (or `/download <link>`)
 - Replying to any message containing a link with `/dl`, `/download`, or `@metahaterbot`
 
-### 3. 1-on-1 Private Chats (Inline Mode with In-Place Media Replacement)
-Because Telegram isolates private 1-on-1 chats from bots, you can invoke `@metahaterbot` via **Inline Mode** in any conversation:
-- Type `@metahaterbot <link>` in any chat and tap the popup card (`📥 Download <Platform> Media`).
-- **Recent Links Memory**: Type `@metahaterbot ` (with a trailing space and no link) to quickly pick from your 5 most recently detected links.
-- **In-Place Replacement**: When you tap the download button on the inline message in your friend's chat, the bot stages the media via your Bot DM to obtain a Telegram `file_id`, calls `edit_message_media` to **transform the inline message directly into the playable video or photo inside the 1-on-1 chat**, and automatically deletes the temporary staging message from your Bot DM.
-  *(Note: Ensure you have sent `/start` to `@metahaterbot` in DM at least once so it has permission to stage media via your DM).*
+### 3. 1-on-1 Private Chats (Inline Mode with Interactive Carousel Pager)
+Invoke `@metahaterbot` via **Inline Mode** in any 1-on-1 private conversation:
+- Type `@metahaterbot <link>` and tap the popup card (`📥 Load <Platform> Media in Chat`).
+- **Recent Links Memory**: Type `@metahaterbot ` (with a trailing space) to pick from your 5 most recently detected links.
+- **In-Place Replacement & Carousel Pager**:
+  - Single videos/photos morph directly in-place inside your 1-on-1 chat via `edit_message_media`.
+  - Multi-slide Instagram carousels morph into Slide 1 and attach interactive **`[ ◀️ Prev ] [ 1 / N ] [ Next ▶️ ]`** buttons backed by cached Telegram `file_id`s so anyone in the chat can flip through full-resolution slides instantaneously.
+  *(Note: Send `/start` to `@metahaterbot` in DM at least once so it can silently stage media via your Bot DM).*
 
 ---
 
 ## ⚙️ Technical Architecture
 
-### Concurrency & Rate Protection
-- **Per-User Lock**: Each user can process **1 media download** at a time.
-- **Global Semaphore**: A maximum of **3 downloads** run concurrently across the server; additional clicks wait in queue (`⏳ Queued (Server busy, please wait)...`).
-
-### Video Optimization (`FFmpeg` NVENC + CPU Fallback)
-Videos are transcoded for instant mobile streaming in Telegram while staying under the 50MB Bot API upload limit:
-- **Primary Encoder**: `-c:v h264_nvenc -preset fast -cq 24` (NVIDIA hardware encoding)
-- **Automatic Fallback**: `-c:v libx264 -preset superfast -crf 24` (if NVENC/CDI is unavailable on the host)
-- **Stream Settings**: Variable framerate (`-vsync 2`), max width 720p (`scale=min(720\,iw):-2`), `yuv420p` pixel format, AAC Mono 128kbps audio (`-c:a aac -ac 1 -b:a 128k`), and `+faststart` MOOV atom placement.
-
-### Connection Resilience
-- Configured with separate `HTTPXRequest` connection pools for outbound API calls and long-polling (`getUpdates`), plus a global error handler to prevent stale keep-alive `httpx.ConnectError` drops.
+- **`services/url_patterns.py`**: Centralized URL regex patterns, platform detection, and SSRF domain allowlist validation (`is_safe_social_url`).
+- **`services/cache.py`**: Bounded LRU `MediaCache` storing canonical URLs, uploaded Telegram `file_id`s (for zero-bandwidth instant repeat downloads and carousel paging), post captions, and recent per-user links.
+- **`services/downloader.py`**: `yt-dlp` + `gallery-dl` + Instagram iframe `/embed/captioned/` parser (`Sec-Fetch-Dest: iframe`), CDN uncropper, and `ffmpeg` optimizer (`h264_nvenc` primary with automatic `libx264` CPU fallback).
+- **`handlers/video.py`**: Message, inline query, and callback handlers with per-user locks (`1` active download/user) and global concurrency semaphore (`3` concurrent downloads).
+- **`AGENTS.md`**: Developer & AI agent instructions and architectural invariants.
 
 ---
 
-## 🚀 Deployment (Dockhand / SputnikX)
+## 🧪 Running Tests
 
-The bot is orchestrated on `sputnik` via the `SputnikXCore` repository (`sputnikcore/metahaterbot/compose.yaml`) as Dockhand Git Stack `metahaterbot` (`stackId: 26`):
-1. Ensure `TELEGRAM_BOT_TOKEN` is set in the Dockhand stack environment variables.
-2. Push updates to `SRINIOLO2/TelegramUtilityBot` (`main`).
-3. Redeploy the `metahaterbot` stack in Dockhand with `buildOnDeploy` enabled.
+```bash
+./venv/bin/python -m unittest discover -s tests -v
+```
+
+---
+
+## 📄 License
+
+Licensed under the [MIT License](LICENSE).

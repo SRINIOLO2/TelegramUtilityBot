@@ -23,16 +23,38 @@ wheels/
 venv/
 ENV/
 
-# Configuration and Environment
+# Secrets, Credentials & Personal Identifiable Information (PII)
 .env
+.env.*
+!.env.example
 config.json
+*secret*
+*credentials*
+cookies.txt
+*cookies*.txt
+*.session
+*.pem
+*.key
+*.crt
+*.log
+user_data/
+*.sqlite
+*.db
 
-# IDEs
+# IDEs & OS metadata
 .vscode/
 .idea/
+.DS_Store
+.superpowers/
 
-# Local/Temp files
+# Local/Temp Media Files
 temp/
 *.mp4
+*.mkv
 *.webm
-cookies.txt
+*.mov
+*.3gp
+*.jpg
+*.jpeg
+*.png
+*.webp
