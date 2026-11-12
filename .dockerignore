@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+cookies.txt
+venv
+.venv
+__pycache__
+*.pyc
+temp
+.superpowers
+.vscode
+.idea
+.DS_Store
